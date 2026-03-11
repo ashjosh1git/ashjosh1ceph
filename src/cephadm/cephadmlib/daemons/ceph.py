@@ -99,6 +99,9 @@ class Ceph(ContainerDaemonForm):
             if 'objectstore' in config_json:
                 objectstore = config_json['objectstore']
                 ctr.args = ctr.args + [f'--osd-objectstore={objectstore}']
+            if 'crush_location' in config_json:
+                c_loc = config_json['crush_location']
+                ctr.args = ctr.args + ['--set-crush-location', c_loc]
         return ctr
 
     _uid_gid: Optional[Tuple[int, int]] = None

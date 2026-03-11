@@ -406,7 +406,46 @@ class OSDService(CephService):
                 config['objectstore'] = svc_spec.objectstore
             if hasattr(svc_spec, 'osd_type') and svc_spec.osd_type:
                 config['osd_type'] = svc_spec.osd_type
+
+        # Preserve existing CRUSH location for (re)deploy so the OSD does not
+        # overwrite it with hostname on startup (see CrushLocation::init_on_startup).
+        if daemon_spec.daemon_id is not None:
+            crush_loc_str = self._get_osd_crush_location_from_cluster(daemon_spec.daemon_id)
+            if crush_loc_str:
+                config['crush_location'] = crush_loc_str
+                logger.debug(
+                    'OSD %s: using current CRUSH location for (re)deploy: %s',
+                    daemon_spec.daemon_id, crush_loc_str,
+                )
+
         return config, parent_deps
+
+    def _get_osd_crush_location_from_cluster(self, osd_id: str) -> Optional[str]:
+        """Get current CRUSH location for an OSD from the cluster (osd find).
+        Returns a string like 'host=incerta01,root=default' or None on failure.
+        """
+        try:
+            ret, out, _ = self.mgr.check_mon_command({
+                'prefix': 'osd find',
+                'id': int(osd_id),
+                'format': 'json',
+            })
+        except (MonCommandFailed, ValueError, TypeError) as e:
+            logger.debug('Could not get CRUSH location for osd.%s: %s', osd_id, e)
+            return None
+        if ret != 0:
+            return None
+        try:
+            data = json.loads(out)
+            loc = data.get('osd_location', {}).get('crush_location') if isinstance(data.get('osd_location'), dict) else data.get('crush_location')
+            if not loc or not isinstance(loc, dict):
+                return None
+            # Format as "type=val,type2=val2" for --set-crush-location.
+            parts = [f'{k}={v}' for k, v in sorted(loc.items())]
+            return ','.join(parts) if parts else None
+        except (json.JSONDecodeError, AttributeError) as e:
+            logger.debug('Could not parse osd find output for osd.%s: %s', osd_id, e)
+            return None
 
 
 class OsdIdClaims(object):
