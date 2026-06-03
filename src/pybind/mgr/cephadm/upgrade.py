@@ -354,7 +354,7 @@ class CephadmUpgrade:
         if not self.upgrade_state or not self.upgrade_state.target_digests:
             return '', []
 
-        daemons = self._get_filtered_daemons()
+        daemons = self._get_filtered_daemons(refresh_cache_for_status=True)
 
         if any(not d.container_image_digests for d in daemons if d.daemon_type == 'mgr'):
             return '', []
@@ -369,15 +369,20 @@ class CephadmUpgrade:
 
         return '%s/%s daemons upgraded' % (done, len(daemons)), completed_types
 
-    def _get_filtered_daemons(self) -> List[DaemonDescription]:
+    def _get_filtered_daemons(
+            self, refresh_cache_for_status: bool = False) -> List[DaemonDescription]:
         # Return the set of daemons set to be upgraded with out current
         # filtering parameters (or all daemons in upgrade order if no filtering
         # parameter are set).
         assert self.upgrade_state is not None
         if self.upgrade_state.daemon_types is not None:
+            logger.debug(
+                f'Filtering daemons to upgrade by daemon types: {self.upgrade_state.daemon_types}')
             daemons = [d for d in self.mgr.cache.get_daemons(
             ) if d.daemon_type in self.upgrade_state.daemon_types]
         elif self.upgrade_state.services is not None:
+            logger.debug(
+                f'Filtering daemons to upgrade by services: {self.upgrade_state.services}')
             daemons = []
             for service in self.upgrade_state.services:
                 daemons += self.mgr.cache.get_daemons_by_service(service)
@@ -385,8 +390,67 @@ class CephadmUpgrade:
             daemons = [d for d in self.mgr.cache.get_daemons(
             ) if d.daemon_type in CEPH_UPGRADE_ORDER]
         if self.upgrade_state.hosts is not None:
+            logger.debug(
+                f'Filtering daemons to upgrade by hosts: {self.upgrade_state.hosts}')
             daemons = [d for d in daemons if d.hostname in self.upgrade_state.hosts]
+
+        if self._upgrade_uses_ok_to_upgrade_for_osds():
+            # Restrict to OSDs the monitor reported for CRUSH bucket as denominator.
+            bset = self._get_osds_in_crush_bucket_names(
+                refresh_cache=refresh_cache_for_status)
+            if bset is not None:
+                daemons = [
+                    daemon for daemon in daemons
+                    if daemon.daemon_type != 'osd'
+                    or daemon.name() in bset
+                ]
         return daemons
+
+    def _get_osds_in_crush_bucket_names(
+            self, refresh_cache: bool = False) -> Optional[Set[str]]:
+        """
+        Return ``osd.<id>`` names for OSDs under the upgrade CRUSH bucket.
+
+        Filled from ``osd ok-to-upgrade`` batch responses during the upgrade loop,
+        or from a membership-only mon query when computing upgrade status.
+        """
+        if self._ok_to_upgrade_osds_in_crush_bucket is not None:
+            return self._ok_to_upgrade_osds_in_crush_bucket
+
+        # Cache is empty. Query mon for OSDs in the bucket for status updates.
+        if refresh_cache and self._refresh_osds_in_crush_bucket_for_status():
+            return self._ok_to_upgrade_osds_in_crush_bucket
+        return None
+
+    def _refresh_osds_in_crush_bucket_for_status(self) -> bool:
+        """
+        Populate bucket OSD membership for upgrade status using max_osds=0
+        """
+        assert self.upgrade_state is not None
+
+        if not self._upgrade_uses_ok_to_upgrade_for_osds():
+            return False
+
+        crush_bucket_name = self.upgrade_state.crush_bucket_name
+        target_version_short = self.upgrade_state.target_version
+
+        if not crush_bucket_name or not target_version_short:
+            return False
+        try:
+            ok_to_upgrade_report = request_osd_ok_to_upgrade_report(
+                self.mgr,
+                crush_bucket_name,
+                target_version_short,
+                max_osds=0,
+            )
+        except (json.JSONDecodeError, MonCommandFailed) as err:
+            logger.debug(
+                'Upgrade: could not refresh osds_in_crush_bucket for status: %s',
+                err)
+            return False
+        self._cache_osds_in_crush_bucket_from_ok_to_upgrade_report(
+            ok_to_upgrade_report)
+        return self._ok_to_upgrade_osds_in_crush_bucket is not None
 
     def _get_current_version(self) -> Tuple[int, int, str]:
         current_version = self.mgr.version.split('ceph version ')[1]
@@ -1792,23 +1856,7 @@ class CephadmUpgrade:
 
         image_settings = self.get_distinct_container_image_settings()
 
-        if self.upgrade_state.daemon_types is not None:
-            logger.debug(
-                f'Filtering daemons to upgrade by daemon types: {self.upgrade_state.daemon_types}')
-            daemons = [d for d in self.mgr.cache.get_daemons(
-            ) if d.daemon_type in self.upgrade_state.daemon_types]
-        elif self.upgrade_state.services is not None:
-            logger.debug(
-                f'Filtering daemons to upgrade by services: {self.upgrade_state.daemon_types}')
-            daemons = []
-            for service in self.upgrade_state.services:
-                daemons += self.mgr.cache.get_daemons_by_service(service)
-        else:
-            daemons = [d for d in self.mgr.cache.get_daemons(
-            ) if d.daemon_type in CEPH_UPGRADE_ORDER]
-        if self.upgrade_state.hosts is not None:
-            logger.debug(f'Filtering daemons to upgrade by hosts: {self.upgrade_state.hosts}')
-            daemons = [d for d in daemons if d.hostname in self.upgrade_state.hosts]
+        daemons = self._get_filtered_daemons()
         upgraded_daemon_count: int = 0
         for daemon_type in CEPH_UPGRADE_ORDER:
             if self.upgrade_state.remaining_count is not None and self.upgrade_state.remaining_count <= 0:
@@ -1833,7 +1881,9 @@ class CephadmUpgrade:
             need_upgrade_self, need_upgrade, need_upgrade_deployer, done = self._detect_need_upgrade(
                 daemons_of_type, target_digests, target_image)
             upgraded_daemon_count += done
-            self._update_upgrade_progress(upgraded_daemon_count / len(daemons))
+            if daemons:
+                self._update_upgrade_progress(
+                    upgraded_daemon_count / len(daemons))
 
             # make sure mgr and monitoring stack daemons are properly redeployed in staggered upgrade scenarios
             # The idea here is to upgrade the mointoring daemons after the mgr is done upgrading as
